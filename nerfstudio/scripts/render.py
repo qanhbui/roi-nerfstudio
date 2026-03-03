@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 import mediapy as media
 import numpy as np
 import torch
+import cv2
 import tyro
 from jaxtyping import Float
 from rich import box, style
@@ -47,10 +48,14 @@ from rich.table import Table
 from torch import Tensor
 from typing_extensions import Annotated
 
+import open3d as o3d
+
 from nerfstudio.cameras.camera_paths import (
     get_interpolated_camera_path,
     get_path_from_json,
+    change_ref_transform_photogrametry,
     get_spiral_path,
+    get_camera_from_json,
 )
 from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager
@@ -61,7 +66,13 @@ from nerfstudio.utils import colormaps, install_checks
 from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE, ItersPerSecColumn
 from nerfstudio.utils.scripts import run_command
+from nerfstudio.utils.io import load_from_json
 
+def get_mean_and_std(x):
+    x_mean, x_std = cv2.meanStdDev(x)
+    x_mean = np.hstack(x_mean)
+    x_std = np.hstack(x_std)
+    return x_mean, x_std
 
 def _render_trajectory_video(
     pipeline: Pipeline,
@@ -75,6 +86,11 @@ def _render_trajectory_video(
     image_format: Literal["jpeg", "png"] = "jpeg",
     jpeg_quality: int = 100,
     colormap_options: colormaps.ColormapOptions = colormaps.ColormapOptions(),
+    origin_name: bool = False,
+    cameras_filenames: List = None,
+    object_pipelines_list: List[Pipeline] = None,
+    object_cameras_list: List[Cameras] = None,
+    apply_color_transfer: bool = False,
 ) -> None:
     """Helper function to create a video of the spiral trajectory.
 
@@ -92,6 +108,12 @@ def _render_trajectory_video(
     CONSOLE.print("[bold green]Creating trajectory " + output_format)
     cameras.rescale_output_resolution(rendered_resolution_scaling_factor)
     cameras = cameras.to(pipeline.device)
+    if object_cameras_list:
+        for index, object_cameras in enumerate(object_cameras_list):
+            object_cameras.rescale_output_resolution(rendered_resolution_scaling_factor)
+            object_cameras = object_cameras.to(pipeline.device)
+            object_cameras_list[index] = object_cameras
+
     fps = len(cameras) / seconds
 
     progress = Progress(
@@ -118,6 +140,31 @@ def _render_trajectory_video(
         # (unless we reserve enough space to overwrite with our uuid tag,
         # but we don't know how big the video file will be, so it's not certain!)
 
+    if object_pipelines_list:
+        dataparser_outputs = pipeline.datamanager.dataparser.get_dataparser_outputs()
+        scene_scale = dataparser_outputs.dataparser_scale
+        scene_transform = dataparser_outputs.dataparser_transform # 3, 4
+        object_dataparser_outputs_list = []
+        object_models_list = []
+        scene_object_boxes_list = []
+        
+        for object_pipeline in object_pipelines_list:
+            object_dataparser_outputs = object_pipeline.datamanager.dataparser.get_dataparser_outputs()
+            
+            object_dataparser_outputs_list.append(object_dataparser_outputs)
+            object_model = object_pipeline.model
+            object_models_list.append(object_model)
+
+            object_photogrametry_pc_box = object_model.photogrametry_pc_box
+            point_min = torch.cat((object_photogrametry_pc_box.aabb[0], torch.tensor([1]))).unsqueeze(-1)
+            point_max = torch.cat((object_photogrametry_pc_box.aabb[1], torch.tensor([1]))).unsqueeze(-1)
+            transformed_point_min = scene_transform @ point_min
+            transformed_point_max = scene_transform @ point_max
+            scene_object_aabb = torch.cat((transformed_point_min.T, transformed_point_max.T), dim = 0)
+            scene_object_aabb *= scene_scale
+            scene_object_box = SceneBox(aabb = scene_object_aabb)
+            scene_object_boxes_list.append(scene_object_box)
+
     with ExitStack() as stack:
         writer = None
 
@@ -129,15 +176,74 @@ def _render_trajectory_video(
                     bounding_box_max = crop_data.center + crop_data.scale / 2.0
                     aabb_box = SceneBox(torch.stack([bounding_box_min, bounding_box_max]).to(pipeline.device))
                 camera_ray_bundle = cameras.generate_rays(camera_indices=camera_idx, aabb_box=aabb_box)
+                if object_cameras_list:
+                    object_camera_ray_bundles_list = []
+                    for index, object_cameras in enumerate(object_cameras_list):
+                        # object_camera_ray_bundle = object_cameras.generate_rays(camera_indices=camera_idx, aabb_box=scene_object_boxes_list[index])
+                        object_camera_ray_bundle = object_cameras.generate_rays(camera_indices=camera_idx, aabb_box=aabb_box)
+                        # object_camera_ray_bundle = object_cameras.generate_rays(camera_indices=camera_idx, aabb_box=object_models_list[index].collider_box)
+                        # object_camera_ray_bundle = object_cameras.generate_rays(camera_indices=camera_idx, aabb_box=object_models_list[index].scene_box)
+                        object_camera_ray_bundles_list.append(object_camera_ray_bundle)
 
                 if crop_data is not None:
                     with renderers.background_color_override_context(
                         crop_data.background_color.to(pipeline.device)
                     ), torch.no_grad():
-                        outputs = pipeline.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+                        if object_pipelines_list:
+                            outputs = pipeline.model.get_outputs_for_camera_ray_bundle(
+                                camera_ray_bundle, 
+                                object_camera_ray_bundles_list=object_camera_ray_bundles_list,
+                                object_models_list=object_models_list, 
+                                dataparser_outputs=dataparser_outputs, 
+                                object_dataparser_outputs_list=object_dataparser_outputs_list,
+                                scene_object_boxes_list=scene_object_boxes_list
+                            )
+                        else: 
+                            outputs = pipeline.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
                 else:
                     with torch.no_grad():
-                        outputs = pipeline.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+                        if object_pipelines_list:
+                            outputs = pipeline.model.get_outputs_for_camera_ray_bundle(
+                                camera_ray_bundle, 
+                                object_camera_ray_bundles_list=object_camera_ray_bundles_list,
+                                object_models_list=object_models_list,
+                                dataparser_outputs=dataparser_outputs, 
+                                object_dataparser_outputs_list=object_dataparser_outputs_list,
+                                scene_object_boxes_list=scene_object_boxes_list
+                            )
+                        else:
+                            outputs = pipeline.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+
+                #NOTE: color transfer composition pixels to scene pixels
+                if apply_color_transfer and "compo_selector" in outputs:
+                    if outputs["compo_selector"].sum().item() > 0 :
+                        compo_pixels = outputs["rgb"][outputs["compo_selector"].squeeze(-1)]
+                        scene_pixels = outputs["compo_scene_rgb"][outputs["compo_selector"].squeeze(-1)]
+                        # scene_pixels = outputs["rgb"][(~outputs["compo_selector"]).squeeze(-1)]
+
+                        compo_pixels = compo_pixels.cpu().numpy()
+                        scene_pixels = scene_pixels.cpu().numpy()
+
+                        compo_pixels = compo_pixels * 255
+                        scene_pixels = scene_pixels * 255
+
+                        compo_pixels = np.expand_dims(compo_pixels, axis=0)
+                        scene_pixels = np.expand_dims(scene_pixels, axis=0)
+
+                        compo_lab = cv2.cvtColor(compo_pixels.astype(np.uint8),cv2.COLOR_RGB2LAB)
+                        scene_lab = cv2.cvtColor(scene_pixels.astype(np.uint8),cv2.COLOR_RGB2LAB)
+
+                        s_mean, s_std = get_mean_and_std(compo_lab)
+                        t_mean, t_std = get_mean_and_std(scene_lab)
+
+                        compo_lab_ct=((compo_lab-s_mean)*(t_std/s_std))+t_mean
+                        compo_rgb_ct = cv2.cvtColor(cv2.convertScaleAbs(compo_lab_ct), cv2.COLOR_LAB2RGB)
+
+                        compo_rgb_ct = np.squeeze(compo_rgb_ct, axis=0)
+                        compo_rgb_ct = torch.from_numpy(compo_rgb_ct).to(outputs["rgb"].device).float()
+
+                        compo_rgb_ct = compo_rgb_ct / 255
+                        outputs["rgb"][outputs["compo_selector"].squeeze(-1)] = compo_rgb_ct
 
                 render_image = []
                 for rendered_output_name in rendered_output_names:
@@ -161,11 +267,26 @@ def _render_trajectory_video(
                 render_image = np.concatenate(render_image, axis=1)
                 if output_format == "images":
                     if image_format == "png":
-                        media.write_image(output_image_dir / f"{camera_idx:05d}.png", render_image, fmt="png")
+                        if origin_name:
+                            image_name = os.path.splitext(os.path.basename(pipeline.datamanager.all_dataset.image_filenames[camera_idx]))[0]
+                            media.write_image(output_image_dir / f"{image_name}_depth.png", render_image, fmt="png")
+                        elif cameras_filenames:
+                            media.write_image(output_image_dir / f"{cameras_filenames[camera_idx]}.png", render_image, fmt="png")
+                        
+                        else:
+                            media.write_image(output_image_dir / f"{camera_idx:05d}.png", render_image, fmt="png")
                     if image_format == "jpeg":
-                        media.write_image(
-                            output_image_dir / f"{camera_idx:05d}.jpg", render_image, fmt="jpeg", quality=jpeg_quality
-                        )
+                        if origin_name:
+                            image_name = os.path.splitext(os.path.basename(pipeline.datamanager.all_dataset.image_filenames[camera_idx]))[0]
+                            media.write_image(output_image_dir / f"{image_name}_depth.jpg", render_image, fmt="jpeg", quality=jpeg_quality)
+                        elif cameras_filenames:
+                            media.write_image(
+                                output_image_dir / f"{cameras_filenames[camera_idx]}.jpg", render_image, fmt="jpeg", quality=jpeg_quality
+                            )
+                        else:
+                            media.write_image(
+                                output_image_dir / f"{camera_idx:05d}.jpg", render_image, fmt="jpeg", quality=jpeg_quality
+                            )
                 if output_format == "video":
                     if writer is None:
                         render_width = int(render_image.shape[1])
@@ -301,7 +422,8 @@ def get_crop_from_json(camera_json: Dict[str, Any]) -> Optional[CropData]:
 class BaseRender:
     """Base class for rendering."""
 
-    load_config: Path
+    # load_config: Path
+    load_config: Optional[Path] = None
     """Path to config YAML file."""
     output_path: Path = Path("renders/output.mp4")
     """Path to output video file."""
@@ -315,7 +437,16 @@ class BaseRender:
     """Specifies number of rays per chunk during eval. If None, use the value in the config file."""
     colormap_options: colormaps.ColormapOptions = colormaps.ColormapOptions()
     """Colormap options."""
-
+    load_objects_configs: Optional[List[str]] = None
+    """Path to object config YAML file."""
+    # load_objects_pcs: Optional[List[str]] = None
+    # """Path to objects .ply Point Cloud to take their photogrametry reference AABBs."""
+    apply_transforms_to_camera_poses: bool = False
+    """Apply dataparser transforms to camera poses."""
+    apply_color_transfer: bool = False
+    """Apply color transfer."""
+    load_hydra_configs: bool = False
+    """Load configurations .yaml file using Hydra."""
 
 @dataclass
 class RenderCameraPath(BaseRender):
@@ -336,13 +467,44 @@ class RenderCameraPath(BaseRender):
             test_mode="inference",
         )
 
+        if self.load_objects_configs:
+            object_pipelines_list = []
+            for object_config in self.load_objects_configs:
+                object_config_path = Path(object_config)
+                _, object_pipeline, _, _ = eval_setup(
+                    object_config_path,
+                    eval_num_rays_per_chunk=self.eval_num_rays_per_chunk,
+                    test_mode="inference",
+                )
+                object_pipelines_list.append(object_pipeline)
+
         install_checks.check_ffmpeg_installed()
 
         with open(self.camera_path_filename, "r", encoding="utf-8") as f:
-            camera_path = json.load(f)
-        seconds = camera_path["seconds"]
-        crop_data = get_crop_from_json(camera_path)
-        camera_path = get_path_from_json(camera_path)
+            camera_path_meta = json.load(f)
+        crop_data = get_crop_from_json(camera_path_meta)
+
+        if self.apply_transforms_to_camera_poses:
+            dataparser_outputs =  pipeline.datamanager.dataparser.get_dataparser_outputs()
+            applied_transform = dataparser_outputs.dataparser_transform
+            applied_scale = dataparser_outputs.dataparser_scale
+            seconds = None
+            
+            camera_path, image_filenames = get_camera_from_json(camera_path_meta, applied_transform, applied_scale)
+            
+            if self.load_objects_configs:
+                object_camera_path_list = []
+                for object_pipeline in object_pipelines_list:
+                    object_dataparser_outputs =  object_pipeline.datamanager.dataparser.get_dataparser_outputs()
+                    object_applied_transform = object_dataparser_outputs.dataparser_transform
+                    object_applied_scale = object_dataparser_outputs.dataparser_scale
+                    
+                    object_camera_path, _ = get_camera_from_json(camera_path_meta, object_applied_transform, object_applied_scale)
+                    object_camera_path_list.append(object_camera_path)
+        else:
+            seconds = camera_path_meta["seconds"]
+            camera_path = get_path_from_json(camera_path_meta)
+            image_filenames = None
 
         if camera_path.camera_type[0] == CameraType.OMNIDIRECTIONALSTEREO_L.value:
             # temp folder for writing left and right view renders
@@ -359,20 +521,73 @@ class RenderCameraPath(BaseRender):
         # add mp4 suffix to video output if none is specified
         if self.output_format == "video" and str(self.output_path.suffix) == "":
             self.output_path = self.output_path.with_suffix(".mp4")
-
-        _render_trajectory_video(
-            pipeline,
-            camera_path,
-            output_filename=self.output_path,
-            rendered_output_names=self.rendered_output_names,
-            rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
-            crop_data=crop_data,
-            seconds=seconds,
-            output_format=self.output_format,
-            image_format=self.image_format,
-            jpeg_quality=self.jpeg_quality,
-            colormap_options=self.colormap_options,
-        )
+        
+        #NOTE: recondition more clearly of apply_transforms, load_object_config
+        if not self.apply_transforms_to_camera_poses and not self.load_objects_configs:
+            _render_trajectory_video(
+                pipeline,
+                camera_path,
+                output_filename=self.output_path,
+                rendered_output_names=self.rendered_output_names,
+                rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
+                crop_data=crop_data,
+                seconds=seconds,
+                output_format=self.output_format,
+                image_format=self.image_format,
+                jpeg_quality=self.jpeg_quality,
+                colormap_options=self.colormap_options,
+            )
+        elif self.apply_transforms_to_camera_poses and self.load_objects_configs:
+            _render_trajectory_video(
+                pipeline,
+                camera_path,
+                output_filename=self.output_path,
+                rendered_output_names=self.rendered_output_names,
+                rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
+                crop_data=crop_data,
+                # seconds=seconds,
+                output_format=self.output_format,
+                image_format=self.image_format,
+                jpeg_quality=self.jpeg_quality,
+                colormap_options=self.colormap_options,
+                cameras_filenames = image_filenames,
+                object_pipelines_list=object_pipelines_list,
+                object_cameras_list=object_camera_path_list,
+                apply_color_transfer=self.apply_color_transfer,
+            )
+        elif self.apply_transforms_to_camera_poses:
+            _render_trajectory_video(
+                pipeline,
+                camera_path,
+                output_filename=self.output_path,
+                rendered_output_names=self.rendered_output_names,
+                rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
+                crop_data=crop_data,
+                # seconds=seconds,
+                output_format=self.output_format,
+                image_format=self.image_format,
+                jpeg_quality=self.jpeg_quality,
+                colormap_options=self.colormap_options,
+                cameras_filenames = image_filenames
+            )
+        else:
+            _render_trajectory_video(
+                pipeline,
+                camera_path,
+                output_filename=self.output_path,
+                rendered_output_names=self.rendered_output_names,
+                rendered_resolution_scaling_factor=1.0 / self.downscale_factor,
+                crop_data=crop_data,
+                seconds=seconds,
+                output_format=self.output_format,
+                image_format=self.image_format,
+                jpeg_quality=self.jpeg_quality,
+                colormap_options=self.colormap_options,
+                # cameras_filenames = image_filenames,
+                object_pipelines_list=object_pipelines_list,
+                object_cameras_list=object_camera_path_list,
+                apply_color_transfer=self.apply_color_transfer,
+            )
 
         if camera_path.camera_type[0] == CameraType.OMNIDIRECTIONALSTEREO_L.value:
             # declare paths for left and right renders
@@ -426,7 +641,7 @@ class RenderInterpolated(BaseRender):
 
     rendered_output_names: List[str] = field(default_factory=lambda: ["rgb"])
     """Name of the renderer outputs to use. rgb, depth, etc. concatenates them along y axis"""
-    pose_source: Literal["eval", "train"] = "eval"
+    pose_source: Literal["eval", "train", "all"] = "eval"
     """Pose source to render."""
     interpolation_steps: int = 10
     """Number of interpolation steps between eval dataset cameras."""
@@ -446,20 +661,30 @@ class RenderInterpolated(BaseRender):
         )
 
         install_checks.check_ffmpeg_installed()
+        origin_name = False
 
         if self.pose_source == "eval":
             assert pipeline.datamanager.eval_dataset is not None
             cameras = pipeline.datamanager.eval_dataset.cameras
-        else:
+        elif self.pose_source == "train":
             assert pipeline.datamanager.train_dataset is not None
             cameras = pipeline.datamanager.train_dataset.cameras
+        else:
+            assert pipeline.datamanager.all_dataset is not None
+            cameras = pipeline.datamanager.all_dataset.cameras
+            origin_name = True
+
 
         seconds = self.interpolation_steps * len(cameras) / self.frame_rate
-        camera_path = get_interpolated_camera_path(
-            cameras=cameras,
-            steps=self.interpolation_steps,
-            order_poses=self.order_poses,
-        )
+        
+        if self.pose_source == "all":
+            camera_path = cameras
+        else:
+            camera_path = get_interpolated_camera_path(
+                cameras=cameras,
+                steps=self.interpolation_steps,
+                order_poses=self.order_poses,
+            )
 
         _render_trajectory_video(
             pipeline,
@@ -471,6 +696,7 @@ class RenderInterpolated(BaseRender):
             output_format=self.output_format,
             image_format=self.image_format,
             colormap_options=self.colormap_options,
+            origin_name = origin_name,
         )
 
 
@@ -516,6 +742,8 @@ class SpiralRender(BaseRender):
             colormap_options=self.colormap_options,
         )
 
+import hydra
+from hydra.core.global_hydra import GlobalHydra
 
 Commands = tyro.conf.FlagConversionOff[
     Union[
@@ -529,8 +757,22 @@ Commands = tyro.conf.FlagConversionOff[
 def entrypoint():
     """Entrypoint for use with pyproject scripts."""
     tyro.extras.set_accent_color("bright_yellow")
-    tyro.cli(Commands).main()
 
+    render_args = tyro.cli(Commands)
+    if render_args.load_hydra_configs:
+        # Clear the existing GlobalHydra instance, if any
+        GlobalHydra.instance().clear()
+
+        hydra.initialize(version_base=None, config_path="conf", job_name="render") # init like @hydra.main()
+        cfg = hydra.compose("render_configs")
+        if isinstance(render_args, RenderCameraPath):
+            # for key, value in cfg.items():
+            for key in cfg.keys():
+                setattr(render_args, key, cfg[key])
+            render_args.main()
+        # TODO: write for other render methods
+    else:
+        tyro.cli(Commands).main()
 
 if __name__ == "__main__":
     entrypoint()

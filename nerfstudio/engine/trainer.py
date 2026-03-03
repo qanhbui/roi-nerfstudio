@@ -84,6 +84,8 @@ class TrainerConfig(ExperimentConfig):
     """Optionally log gradients during training"""
     gradient_accumulation_steps: int = 1
     """Number of steps to accumulate gradients over."""
+    load_hydra_configs: bool = False
+    """Load configurations .yaml file using Hydra."""
 
 
 class Trainer:

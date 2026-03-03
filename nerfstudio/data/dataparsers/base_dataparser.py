@@ -58,7 +58,21 @@ class DataparserOutputs:
     alpha_color: Optional[Float[Tensor, "3"]] = None
     """Color of dataset background."""
     scene_box: SceneBox = SceneBox(aabb=torch.tensor([[-1, -1, -1], [1, 1, 1]]))
-    """Scene box of dataset. Used to bound the scene or provide the scene scale depending on model."""
+    """Scene box of dataset. Used to bound the scene or provide the scene scale depending on model.
+    We redefined this is the box of object for object NeRF, and box of all camera for scene NeRF. 
+
+    """
+    cam_box: SceneBox = SceneBox(aabb=torch.tensor([[-1, -1, -1], [1, 1, 1]]))
+    """Camera box of dataset. Used to bound the scene or provide the scene scale depending on model.
+    We redefined this is the box of all camera.  
+
+    """
+    photogrametry_pc_box: Optional[SceneBox] = None
+    """AABB of photogrametry reference of Point Cloud. Used to store infos for render multiple objects."""
+    N_max: Optional[int] = None
+    """Finest resolution of Object model. Used to store infos for object training."""
+    N_min: Optional[int] = None
+    """Coarsest resolution of Object model. Used to store infos for object training."""
     mask_filenames: Optional[List[Path]] = None
     """Filenames for any masks that are required"""
     metadata: Dict[str, Any] = to_immutable_dict({})
@@ -81,10 +95,22 @@ class DataparserOutputs:
         Args:
             path: path to save transform to
         """
-        data = {
-            "transform": self.dataparser_transform.tolist(),
-            "scale": float(self.dataparser_scale),
-        }
+        if self.photogrametry_pc_box is not None: 
+            data = {
+                "transform": self.dataparser_transform.tolist(),
+                "scale": float(self.dataparser_scale),
+                "scene_box": self.scene_box.aabb.tolist(),
+                "cam_box": self.cam_box.aabb.tolist(),
+                "photogrametry_pc_box": self.photogrametry_pc_box.aabb.tolist(),
+            }
+        else:
+            data = {
+                "transform": self.dataparser_transform.tolist(),
+                "scale": float(self.dataparser_scale),
+                "scene_box": self.scene_box.aabb.tolist(),
+                "cam_box": self.cam_box.aabb.tolist()
+            }
+
         if not path.parent.exists():
             path.parent.mkdir(parents=True)
         with open(path, "w", encoding="UTF-8") as file:

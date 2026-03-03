@@ -460,6 +460,10 @@ class Cameras(TensorDataclass):
         # If we have mandated that we don't keep the shape, then we flatten
         if keep_shape is False:
             raybundle = raybundle.flatten()
+        
+        if len(raybundle.origins.shape) == 2:
+            raybundle.height = cameras.height[camera_indices][0, 0, 0].item()
+            raybundle.width = cameras.width[camera_indices][0, 0, 0].item()
 
         if aabb_box:
             with torch.no_grad():
@@ -475,10 +479,13 @@ class Cameras(TensorDataclass):
                 rays_d = rays_d.reshape((-1, 3))
 
                 t_min, t_max = nerfstudio.utils.math.intersect_aabb(rays_o, rays_d, tensor_aabb)
-
-                t_min = t_min.reshape([shape[0], shape[1], 1])
-                t_max = t_max.reshape([shape[0], shape[1], 1])
-
+                
+                if len(shape) == 3:
+                    t_min = t_min.reshape([shape[0], shape[1], 1])
+                    t_max = t_max.reshape([shape[0], shape[1], 1])
+                elif len(shape) == 2:
+                    t_min = t_min.reshape([shape[0], 1])
+                    t_max = t_max.reshape([shape[0], 1])
                 raybundle.nears = t_min
                 raybundle.fars = t_max
 

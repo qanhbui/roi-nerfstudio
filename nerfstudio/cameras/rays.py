@@ -186,7 +186,455 @@ class RaySamples(TensorDataclass):
         if weights_only:
             return weights
         return weights, transmittance
+    
+def match_ray_samples_with_selector(
+        ray_samples_1: RaySamples, 
+        ray_samples_2: RaySamples, 
+        selector: Tensor):
+        """Match ray samples 2 to the reference ray samples 1 with indices from selectors
+        Args:
+            ray_samples_1 : ray_samples reference
+            ray_samples_2 : ray_samples need to expand to mactch reference
+        """
+        
+        starts = ray_samples_1.spacing_starts[..., 0] # num, 48
+        starts[selector] = ray_samples_2.spacing_starts[..., 0] 
 
+        # bins
+        ends = ray_samples_1.spacing_ends[..., -1:, 0]
+        ends[selector] = ray_samples_2.spacing_ends[..., -1:, 0]
+        bins = torch.cat([starts, ends], dim=-1)
+        # Stop gradients
+        bins = bins.detach()
+
+        euclidean_bins = ray_samples_2.spacing_to_euclidean_fn(bins)
+        
+        bin_starts = euclidean_bins[..., :-1, None]
+        bin_ends = euclidean_bins[..., 1:, None]
+        spacing_starts = bins[..., :-1, None]
+        spacing_ends = bins[..., 1:, None]
+        spacing_to_euclidean_fn = ray_samples_2.spacing_to_euclidean_fn
+
+        deltas = bin_ends - bin_starts
+        camera_indices = ray_samples_1.camera_indices
+        camera_indices[selector] = ray_samples_2.camera_indices
+
+        origins = ray_samples_1.frustums.origins
+        origins[selector] = ray_samples_2.frustums.origins
+        directions = ray_samples_1.frustums.directions
+        directions[selector] = ray_samples_2.frustums.directions
+        pixel_area = ray_samples_1.frustums.pixel_area
+        pixel_area[selector] = ray_samples_2.frustums.pixel_area
+        
+        metadata = ray_samples_1.metadata.copy()
+        metadata_2 = ray_samples_2.metadata
+        for key in metadata.keys():
+            metadata[key][selector] = metadata_2[key]
+
+        if ray_samples_1.times and ray_samples_2.times:
+            times = ray_samples_1.times
+            times[selector] = ray_samples_2.times
+        else:
+            times = None
+
+        frustums = Frustums(
+            origins=origins,
+            directions=directions,
+            starts=bin_starts,
+            ends=bin_ends,
+            pixel_area=pixel_area,
+        )
+
+        matched_ray_samples = RaySamples(
+            frustums=frustums,
+            camera_indices=camera_indices,
+            deltas=deltas,
+            spacing_starts=spacing_starts,
+            spacing_ends=spacing_ends,
+            spacing_to_euclidean_fn=spacing_to_euclidean_fn,
+            metadata=metadata,
+            times=times
+        )
+
+        return matched_ray_samples
+    
+def merge_different_ray_samples_with_indices(
+        ray_samples_1: RaySamples, 
+        ray_samples_2: RaySamples, 
+        inside_selector_1: Tensor, 
+        inside_selector_2: Tensor,
+        inside_ray_indices: Tensor,
+        scale_transform: Float):
+        """Merge two set of different ray samples with indices from selectors, apply transform and return sorted index which can be used to merge field outputs
+        Args:
+            ray_samples_1 : ray_samples to merge
+            ray_samples_2 : ray_samples to merge
+        """
+        inside_ray_samples_1 = ray_samples_1[inside_ray_indices]
+        inside_ray_samples_2 = ray_samples_2[inside_ray_indices]
+
+        inside_rays_selector_1 = inside_selector_1[inside_ray_indices]
+        inside_rays_selector_2 = inside_selector_2[inside_ray_indices]
+
+        assert inside_ray_samples_1.spacing_starts is not None and inside_ray_samples_2.spacing_starts is not None
+        assert inside_ray_samples_1.spacing_ends is not None and inside_ray_samples_2.spacing_ends is not None
+        assert inside_ray_samples_1.spacing_to_euclidean_fn is not None
+        
+        starts_1 = inside_ray_samples_1.spacing_starts[..., 0] # num, 48
+        starts_2 = inside_ray_samples_2.spacing_starts[..., 0] * scale_transform
+
+        min_starts_1 = starts_1[..., 0].unsqueeze(-1).expand(-1, starts_1.size(-1))
+
+        # bins
+        starts_1[inside_rays_selector_1] = min_starts_1[inside_rays_selector_1]
+        starts_2[~inside_rays_selector_2] = min_starts_1[~inside_rays_selector_2]
+        bins, sorted_index = torch.sort(torch.cat([starts_1, starts_2], -1), -1)
+
+        ends = inside_ray_samples_1.spacing_ends[..., -1:, 0]
+        bins = torch.cat([bins, ends], dim=-1)
+        # Stop gradients
+        bins = bins.detach()
+
+        euclidean_bins = inside_ray_samples_1.spacing_to_euclidean_fn(bins)
+        
+        bin_starts = euclidean_bins[..., :-1, None]
+        bin_ends = euclidean_bins[..., 1:, None]
+        spacing_starts = bins[..., :-1, None]
+        spacing_ends = bins[..., 1:, None]
+        spacing_to_euclidean_fn = inside_ray_samples_1.spacing_to_euclidean_fn
+
+        deltas = bin_ends - bin_starts
+        camera_indices = inside_ray_samples_1.camera_indices[..., 0, None, :].repeat(1, spacing_starts.size(1), 1) # num, 48, 1 -> num, 1, 1 -> num, 48*2, 1 
+
+        origins = inside_ray_samples_1.frustums.origins[..., 0, None, :].repeat(1, spacing_starts.size(1), 1)
+        directions = inside_ray_samples_1.frustums.directions[..., 0, None, :].repeat(1, spacing_starts.size(1), 1)
+        pixel_area = inside_ray_samples_1.frustums.pixel_area[..., 0, None, :].repeat(1, spacing_starts.size(1), 1)
+        
+        metadata = inside_ray_samples_1.metadata.copy()
+        for key in metadata.keys():
+            metadata[key] = metadata[key][..., 0, None, :].repeat(1, spacing_starts.size(1), 1)
+
+        times = None if inside_ray_samples_1.times is None else inside_ray_samples_1.times[..., 0, None, :].repeat(1, spacing_starts.size(1), 1)
+
+        frustums = Frustums(
+            origins=origins,
+            directions=directions,
+            starts=bin_starts,
+            ends=bin_ends,
+            pixel_area=pixel_area,
+        )
+
+        merged_ray_samples = RaySamples(
+            frustums=frustums,
+            camera_indices=camera_indices,
+            deltas=deltas,
+            spacing_starts=spacing_starts,
+            spacing_ends=spacing_ends,
+            spacing_to_euclidean_fn=spacing_to_euclidean_fn,
+            metadata=metadata,
+            times=times
+        )
+
+        return merged_ray_samples, sorted_index
+
+def merge_spacing_bins(  # bins spacing
+        ray_samples_1: RaySamples, 
+        ray_samples_2: RaySamples, 
+        merged_spacing_bins: Optional[Tensor], 
+        selector_1: Tensor, 
+        selector_2: Tensor,
+        merged_selector: Optional[Tensor], 
+        scale_transform: Float):
+        """Merge two set of different ray samples with indices from selectors, apply transform and return sorted index which can be used to merge field outputs
+        Args:
+            ray_samples_1 : ray_samples to merge
+            ray_samples_2 : ray_samples to merge
+            merged_spacing_bins : ofray samples [0,1]
+        """
+        assert ray_samples_1.spacing_starts is not None and ray_samples_2.spacing_starts is not None
+        assert ray_samples_1.spacing_ends is not None and ray_samples_2.spacing_ends is not None
+        assert ray_samples_1.spacing_to_euclidean_fn is not None
+
+        if torch.is_tensor(merged_spacing_bins) and torch.is_tensor(merged_selector):
+            selector = merged_selector
+            starts_1 = merged_spacing_bins[..., :-1] # num, 48
+            ends = merged_spacing_bins[..., -1:] # num, 1
+        else:
+            selector = selector_1
+            starts_1 = ray_samples_1.spacing_starts[..., 0] # num, 48, 1 -> num, 48
+            ends = ray_samples_1.spacing_ends[..., -1:, 0]
+        
+        starts_2 = ray_samples_2.spacing_starts[..., 0] * scale_transform
+
+        min_starts = starts_1[..., 0]
+        min_starts_1 = min_starts.unsqueeze(-1).expand_as(starts_1)
+        min_starts_2 = min_starts.unsqueeze(-1).expand_as(starts_2)
+
+        # starts_1[~selector] = min_starts_1[~selector]
+        # starts_2[~selector_2] = min_starts_2[~selector_2]
+        starts_1 = (starts_1 * selector) + ((~selector) * min_starts_1)
+        starts_2 = (starts_2 * selector_2) + ((~selector_2) * min_starts_2)
+
+        bins, sorted_index = torch.sort(torch.cat([starts_1, starts_2], -1), -1)
+
+        bins = torch.cat([bins, ends], dim=-1) # num, 48+1
+        return bins, sorted_index
+
+def get_rays_from_spacing_bins(
+        ray_samples: RaySamples,
+        spacing_bins: Tensor):
+        """Set new ray samples from bins.
+        Args:
+            ray_samples : ray_samples reference
+            spacing_bins : spacing_bins [0,1] to build new ray_samples
+        """
+        # Stop gradients
+        spacing_bins = spacing_bins.detach()
+
+        euclidean_bins = ray_samples.spacing_to_euclidean_fn(spacing_bins)
+        
+        bin_starts = euclidean_bins[..., :-1, None]
+        bin_ends = euclidean_bins[..., 1:, None]
+        spacing_starts = spacing_bins[..., :-1, None] # num, 48 -> num, 48, 1 
+        spacing_ends = spacing_bins[..., 1:, None]
+        spacing_to_euclidean_fn = ray_samples.spacing_to_euclidean_fn
+
+        deltas = bin_ends - bin_starts
+        num_samples = spacing_starts.size(1)
+        camera_indices = ray_samples.camera_indices[..., 0, None, :].repeat(1,num_samples, 1)
+
+        origins = ray_samples.frustums.origins[..., 0, None, :].repeat(1, num_samples, 1)
+        directions = ray_samples.frustums.directions[..., 0, None, :].repeat(1, num_samples, 1)
+        pixel_area = ray_samples.frustums.pixel_area[..., 0, None, :].repeat(1, num_samples, 1)
+        
+        metadata = ray_samples.metadata.copy()
+        for key in metadata.keys():
+            metadata[key] = metadata[key][..., 0, None, :].repeat(1, num_samples, 1)
+
+        times = None if ray_samples.times is None else ray_samples.times[..., 0, None, :].repeat(1, num_samples, 1)
+
+        frustums = Frustums(
+            origins=origins,
+            directions=directions,
+            starts=bin_starts,
+            ends=bin_ends,
+            pixel_area=pixel_area,
+        )
+
+        final_ray_samples = RaySamples(
+            frustums=frustums,
+            camera_indices=camera_indices,
+            deltas=deltas,
+            spacing_starts=spacing_starts,
+            spacing_ends=spacing_ends,
+            spacing_to_euclidean_fn=spacing_to_euclidean_fn,
+            metadata=metadata,
+            times=times
+        )
+
+        return final_ray_samples
+
+def get_rays_samples_with_indices(ray_samples: RaySamples, ray_indices: Int[Tensor, "*num_indices"]):
+    """Get rays samples using indices
+    Args:
+        ray_samples : ray_samples
+        indices : ray indices 
+    """
+    indiced_frustum = ray_samples.frustums[ray_indices]
+    indiced_camera_indices = ray_samples.camera_indices[ray_indices]
+    indiced_deltas = ray_samples.deltas[ray_indices]
+    indiced_spacing_starts = ray_samples.spacing_starts[ray_indices]
+    indiced_spacing_ends = ray_samples.spacing_ends[ray_indices]
+    indiced_spacing_to_euclidean_fn = ray_samples.spacing_to_euclidean_fn
+    indiced_metadata = ray_samples.metadata.copy()
+    for key in indiced_metadata.keys():
+        indiced_metadata[key] = indiced_metadata[key][ray_indices]
+
+    indiced_times = None if ray_samples.times is None else ray_samples.times[ray_indices]
+
+    indiced_ray_samples = RaySamples(
+        frustums=indiced_frustum,
+        camera_indices=indiced_camera_indices,
+        deltas=indiced_deltas,
+        spacing_starts=indiced_spacing_starts,
+        spacing_ends=indiced_spacing_ends,
+        spacing_to_euclidean_fn=indiced_spacing_to_euclidean_fn,
+        metadata=indiced_metadata,
+        times=indiced_times,
+    )
+    return indiced_ray_samples
+
+def get_samples_inside_box(ray_samples: RaySamples, aabb: Float[Tensor, "2 3"]):
+    """Get points inside object box
+    Args:
+        ray_samples : ray_samples
+        aabb : object aabb that contain min and max 3D points
+    """
+
+    positions = ray_samples.frustums.get_positions()
+    min_point = aabb[0]
+    max_point = aabb[1]
+    inside_selector = ((positions[..., 0] >= min_point[0].item()) & (positions[..., 0] <= max_point[0].item())
+                       & (positions[..., 1] >= min_point[1].item()) & (positions[..., 1] <= max_point[1].item())
+                       & (positions[..., 2] >= min_point[2].item()) & (positions[..., 2] <= max_point[2].item()))
+    return inside_selector
+
+def get_rays_inside_box(ray_depths: Float[Tensor, "*num_rays 1"], aabb: Float[Tensor, "2 3"]):
+    """Get points inside object box
+    Args:
+        ray_samples : ray_samples
+        aabb : object aabb that contain min and max 3D points
+    """
+
+    positions = ray_depths
+    min_point = aabb[0]
+    max_point = aabb[1]
+    inside_selector = ((positions[..., 0] >= min_point[0].item()) & (positions[..., 0] <= max_point[0].item())
+                       & (positions[..., 1] >= min_point[1].item()) & (positions[..., 1] <= max_point[1].item())
+                       & (positions[..., 2] >= min_point[2].item()) & (positions[..., 2] <= max_point[2].item()))
+    return inside_selector
+
+def get_samples_selector(ray_samples: RaySamples, t_min: Float[Tensor, "*num_rays"], t_max: Float[Tensor, "*num_rays"], inside: bool = True):
+    """Get points inside object box
+    Args:
+        ray_samples : ray_samples
+        aabb : object aabb that contain min and max 3D points
+    """
+    assert ray_samples.spacing_starts is not None 
+    assert ray_samples.spacing_ends is not None
+
+    # starts = ray_samples.spacing_starts[..., 0] # num, 48, 1 -> num, 48 : [0,1]48
+    starts = ray_samples.frustums.starts[..., 0] # num, 48, 1 -> num, 48 : [0,20]48
+    # ends = ray_samples.spacing_ends[..., -1:, 0]
+    # bins = torch.cat([starts, ends], dim=-1)
+
+    # ends = ray_samples.spacing_ends[..., 0]
+    ends = ray_samples.frustums.ends[..., 0]
+    centers = (starts + ends) / 2
+
+    t_min = t_min.unsqueeze(-1).expand_as(centers) # num -> num, 48
+    t_max = t_max.unsqueeze(-1).expand_as(centers)
+
+    # selector = (bins >= t_min) & (bins <= t_max)
+    selector = (centers >= t_min) & (centers <= t_max) # num, 48
+    if inside:
+        return selector
+    else:
+        return ~selector
+    
+def get_bins_selector(spacing_bins: Tensor, ray_samples: RaySamples, t_min: Float[Tensor, "*num_rays"], t_max: Float[Tensor, "*num_rays"], inside: bool = True):
+    """Get bins inside object box
+    Args:
+        spacing_bins : spacing_bins
+        ray_samples : ray_samples reference
+    """
+    # starts = ray_samples.spacing_starts[..., 0]
+    
+    # Transform spacing_bins to bins of frustum before compare
+    bins = ray_samples.spacing_to_euclidean_fn(spacing_bins)
+
+    starts = bins[..., :-1]
+
+    # ends = ray_samples.spacing_ends[..., 0]
+    ends = bins[..., 1:]
+    centers = (starts + ends) / 2
+
+    t_min = t_min.unsqueeze(-1).expand_as(centers)
+    t_max = t_max.unsqueeze(-1).expand_as(centers)
+
+    # selector = (bins >= t_min) & (bins <= t_max)
+    selector = (centers >= t_min) & (centers <= t_max) # num, 48
+    if inside:
+        return selector
+    else:
+        return ~selector
+
+def get_4D_points(ray_samples: RaySamples):
+    """Get 4D points from 3D points of ray samples
+    Args:
+        ray_samples : ray_samples
+    """
+    
+    positions_flat = ray_samples.frustums.get_positions().view(-1, 3) # 1572864, 3
+    output_positions = torch.cat(
+        (
+            positions_flat, # n, 3 >< n, 3, 4
+            torch.tensor([[1]], dtype=positions_flat.dtype, device=positions_flat.device).repeat_interleave(len(positions_flat), 0),
+        ),
+        1,
+    ) # n, 4
+
+    return output_positions
+
+def transform_ray_samples(ray_samples: RaySamples, scene_scale: Float, inv_scene_transform: Float[Tensor, "4 4"], roi_scale: Float, roi_transform: Float[Tensor, "4 4"]):
+    """Transform 3D points of ray_samples from A to B
+    Args:
+        ray_samples : ray_samples
+    """
+    
+    positions_flat = ray_samples.frustums.get_positions().view(-1, 3) # 1572864, 3
+    output_positions = torch.cat(
+        (
+            positions_flat, # n, 3 >< n, 3, 4
+            torch.tensor([[1]], dtype=positions_flat.dtype, device=positions_flat.device).repeat_interleave(len(positions_flat), 0),
+        ),
+        1,
+    ) # n, 4
+
+    output_positions[..., :3] /= scene_scale # n, 4
+    output_positions = inv_scene_transform @ (output_positions.T) # 4, 4 @ 4, n = 4, n
+    output_positions = roi_transform @ output_positions # 4, 4 @ 4, n = 4, n
+    output_positions = output_positions.T # n, 4
+    output_positions[..., :3] *= roi_scale
+    output_positions = output_positions[:, :3]
+
+    return output_positions
+
+def transform_points(positions: Float[Tensor, "*batch 3"], scene_scale: Float, inv_scene_transform: Float[Tensor, "4 4"], roi_scale: Float, roi_transform: Float[Tensor, "4 4"]):
+    """Transform 3D points of ray_samples from A to B
+    Args:
+        ray_samples : ray_samples
+    """
+    output_positions = torch.cat(
+        (
+            positions, # n, 3 >< n, 3, 4
+            torch.tensor([[1]], dtype=positions.dtype, device=positions.device).repeat_interleave(len(positions), 0),
+        ),
+        1,
+    ) # n, 4
+
+    output_positions[..., :3] /= scene_scale # n, 4
+    output_positions = inv_scene_transform @ (output_positions.T) # 4, 4 @ 4, n = 4, n
+    output_positions = roi_transform @ output_positions # 4, 4 @ 4, n = 4, n
+    output_positions = output_positions.T # n, 4
+    output_positions[..., :3] *= roi_scale
+    output_positions = output_positions[:, :3]
+
+    return output_positions
+
+def transform_single_point(position: Float[Tensor, "3"], scene_scale: Float, inv_scene_transform: Float[Tensor, "4 4"], roi_scale: Float, roi_transform: Float[Tensor, "4 4"]):
+    """Transform 3D points from A to B
+    Args:
+    
+    """
+    
+    position = position.unsqueeze(0) # 1572864, 3
+    output_positions = torch.cat(
+        (
+            position, # n, 3 >< n, 3, 4
+            torch.tensor([[1]], dtype=position.dtype, device=position.device),
+        ),
+        1,
+    ) # n, 4
+
+    output_positions[..., :3] /= scene_scale # n, 4
+    output_positions = inv_scene_transform @ (output_positions.T) # 4, 4 @ 4, n = 4, n
+    output_positions = roi_transform @ output_positions # 4, 4 @ 4, n = 4, n
+    output_positions = output_positions.T # n, 4
+    output_positions[..., :3] *= roi_scale
+    output_positions = output_positions[:, :3]
+
+    return output_positions
 
 @dataclass
 class RayBundle(TensorDataclass):
@@ -209,6 +657,10 @@ class RayBundle(TensorDataclass):
     """Additional metadata or data needed for interpolation, will mimic shape of rays"""
     times: Optional[Float[Tensor, "*batch 1"]] = None
     """Times at which rays are sampled"""
+    height: Optional[Int] = None
+    """Original image height"""
+    width: Optional[Int] = None
+    """Original image width"""
 
     def set_camera_indices(self, camera_index: int) -> None:
         """Sets all the camera indices to a specific camera index.

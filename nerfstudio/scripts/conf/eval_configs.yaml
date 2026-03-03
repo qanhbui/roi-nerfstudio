@@ -1,0 +1,29 @@
+## Cmd samples
+# nohup python3.9 ../eval_compo.py benchmark --load-hydra-configs=True > ../logs/eval_base.txt &
+
+load_config:
+  - <trained_path1>/config.yml
+  - <trained_path2>/config.yml
+  - <trained_path3>/config.yml
+
+load_objects_configs:
+  - <trained_path1>/config.yml
+  - <trained_path2>/config.yml
+  - <trained_path3>/config.yml
+
+camera_path_filenames:
+  - ../test_transforms_roi_1.json
+  - ../test_transforms_roi_2.json
+
+output_path: !!python/object/apply:pathlib.Path
+  - <output_path>/scores
+
+render_output_path: !!python/object/apply:pathlib.Path
+  - <output_path>/renders
+
+# eval_mode: 'base'
+# eval_mode: 'single'
+# eval_mode: 'full_rois'
+# eval_mode: 'single_aabb'
+# eval_mode: 'full_aabb'
+# eval_mode: 'all'

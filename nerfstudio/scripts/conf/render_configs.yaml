@@ -1,0 +1,23 @@
+output_format: images 
+image_format: png 
+# rendered_output_names: [compo_scene_rgb]
+
+# Hotel
+load_config: !!python/object/apply:pathlib.Path
+  - <trained_path>/config.yml
+  
+apply_transforms_to_camera_poses: True 
+# apply_color_transfer: True
+camera_path_filename: ../<cam_path>.json
+
+load_objects_configs: 
+  - <trained_path1>/config.yml
+  - <trained_path2>/config.yml
+  - <trained_path3>/config.yml
+
+output_path: !!python/object/apply:pathlib.Path
+  - <output_path>
+
+
+## Cmd samples
+# ns-render camera-path --load-hydra-configs=True > ../logs/test.txt &

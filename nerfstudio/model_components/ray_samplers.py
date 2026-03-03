@@ -113,7 +113,7 @@ class SpacedSampler(Sampler):
         s_near, s_far = (self.spacing_fn(x) for x in (ray_bundle.nears, ray_bundle.fars))
 
         def spacing_to_euclidean_fn(x):
-            return self.spacing_fn_inv(x * s_far + (1 - x) * s_near)
+            return self.spacing_fn_inv(x * s_far[:x.size(0)] + (1 - x) * s_near[:x.size(0)])
 
         euclidean_bins = spacing_to_euclidean_fn(bins)  # [num_rays, num_samples+1]
 
@@ -762,6 +762,69 @@ class NeuSSampler(Sampler):
         starts_2 = ray_samples_2.spacing_starts[..., 0]
 
         ends = torch.maximum(ray_samples_1.spacing_ends[..., -1:, 0], ray_samples_2.spacing_ends[..., -1:, 0])
+
+        bins, sorted_index = torch.sort(torch.cat([starts_1, starts_2], -1), -1)
+
+        bins = torch.cat([bins, ends], dim=-1)
+
+        # Stop gradients
+        bins = bins.detach()
+
+        euclidean_bins = ray_samples_1.spacing_to_euclidean_fn(bins)
+
+        ray_samples = ray_bundle.get_ray_samples(
+            bin_starts=euclidean_bins[..., :-1, None],
+            bin_ends=euclidean_bins[..., 1:, None],
+            spacing_starts=bins[..., :-1, None],
+            spacing_ends=bins[..., 1:, None],
+            spacing_to_euclidean_fn=ray_samples_1.spacing_to_euclidean_fn,
+        )
+
+        return ray_samples, sorted_index
+
+    @staticmethod
+    def get_ray_samples_with_ray_bundle(ray_bundle: RayBundle, ray_samples: RaySamples):
+        """Get ray samples from ray bun
+            ray_samples : ray_samples
+        """
+
+        assert ray_samples.spacing_starts is not None
+        assert ray_samples.spacing_ends is not None
+        assert ray_samples.spacing_to_euclidean_fn is not None
+        starts = ray_samples.spacing_starts[..., 0]
+
+        ends = ray_samples.spacing_ends[..., -1:, 0]
+        bins = torch.cat([starts, ends], dim=-1)
+
+        # Stop gradients
+        bins = bins.detach()
+
+        euclidean_bins = ray_samples.spacing_to_euclidean_fn(bins)
+
+        ray_samples = ray_bundle.get_ray_samples(
+            bin_starts=euclidean_bins[..., :-1, None],
+            bin_ends=euclidean_bins[..., 1:, None],
+            spacing_starts=bins[..., :-1, None],
+            spacing_ends=bins[..., 1:, None],
+            spacing_to_euclidean_fn=ray_samples.spacing_to_euclidean_fn,
+        )
+
+        return ray_samples
+    
+    def merge_different_ray_samples(ray_bundle: RayBundle, ray_samples_1: RaySamples, ray_samples_2: RaySamples, scale_transform: Float):
+        """Merge two set of different ray samples, apply transform and return sorted index which can be used to merge field outputs
+        Args:
+            ray_samples_1 : ray_samples to merge
+            ray_samples_2 : ray_samples to merge
+        """
+
+        assert ray_samples_1.spacing_starts is not None and ray_samples_2.spacing_starts is not None
+        assert ray_samples_1.spacing_ends is not None and ray_samples_2.spacing_ends is not None
+        assert ray_samples_1.spacing_to_euclidean_fn is not None
+        starts_1 = ray_samples_1.spacing_starts[..., 0]
+        starts_2 = ray_samples_2.spacing_starts[..., 0] * scale_transform
+
+        ends = torch.maximum(ray_samples_1.spacing_ends[..., -1:, 0], ray_samples_2.spacing_ends[..., -1:, 0]*scale_transform)
 
         bins, sorted_index = torch.sort(torch.cat([starts_1, starts_2], -1), -1)
 

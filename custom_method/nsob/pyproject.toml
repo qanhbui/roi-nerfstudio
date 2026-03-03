@@ -1,0 +1,18 @@
+[project]
+name = "nsob"
+version = "0.1.0"
+
+dependencies=[
+    "nerfstudio>=0.3.0"
+]
+
+[tool.setuptools.packages.find]
+include = ["nsob*"]
+
+[project.entry-points.'nerfstudio.method_configs']
+nsob = 'nsob.nsob_config:nsob_method'
+nsobject = 'nsob.nsob_config:nsobject_method'
+depth_nsob = 'nsob.nsob_config:depth_nsob_method'
+
+[project.entry-points.'nerfstudio.dataparser_configs']
+object-nerf-data = 'nsob.configs.nsob_dataparser_config:NsobDataparser'

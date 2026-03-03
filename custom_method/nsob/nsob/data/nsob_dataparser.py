@@ -1,19 +1,6 @@
-# Copyright 2022 the Regents of the University of California, Nerfstudio Team and contributors. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-""" Data parser for nerfstudio datasets. """
+""" Data parser for nsob datasets. """
 
-from __future__ import annotations
+# from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
@@ -22,29 +9,29 @@ from typing import Literal, Optional, Type
 
 import numpy as np
 import torch
-import open3d as o3d
-
 from PIL import Image
 
 from nerfstudio.cameras import camera_utils
-from nerfstudio.cameras.cameras import CAMERA_MODEL_TO_TYPE, Cameras, CameraType
+from nerfstudio.cameras.cameras import CAMERA_MODEL_TO_TYPE, CameraType
+from nsob.nsob_cameras import NsobCameras
+
 from nerfstudio.data.dataparsers.base_dataparser import (
     DataParser,
     DataParserConfig,
     DataparserOutputs,
 )
 from nerfstudio.data.scene_box import SceneBox
-from nerfstudio.utils.io import load_from_json, write_to_json
+from nerfstudio.utils.io import load_from_json
 from nerfstudio.utils.rich_utils import CONSOLE
 
 MAX_AUTO_RESOLUTION = 1600
 
 
 @dataclass
-class NerfstudioDataParserConfig(DataParserConfig):
-    """Nerfstudio dataset config"""
+class NsobDataParserConfig(DataParserConfig):
+    """Nsob dataset config"""
 
-    _target: Type = field(default_factory=lambda: Nerfstudio)
+    _target: Type = field(default_factory=lambda: Nsob)
     """target class to instantiate"""
     data: Path = Path()
     """Directory or explicit json file path specifying location of data."""
@@ -64,15 +51,13 @@ class NerfstudioDataParserConfig(DataParserConfig):
     """The fraction of images to use for training. The remaining images are for eval."""
     depth_unit_scale_factor: float = 1e-3
     """Scales the depth values to meters. Default value is 0.001 for a millimeter to meter conversion."""
-    object_pc_path: str = None
-    """Oject dense point cloud .ply file path."""
 
 
 @dataclass
-class Nerfstudio(DataParser):
-    """Nerfstudio DatasetParser"""
+class Nsob(DataParser):
+    """Nsob DatasetParser"""
 
-    config: NerfstudioDataParserConfig
+    config: NsobDataParserConfig
     downscale_factor: Optional[int] = None
 
     def _generate_dataparser_outputs(self, split="train"):
@@ -200,6 +185,8 @@ class Nerfstudio(DataParser):
                 indices = i_train
             elif split in ["val", "test"]:
                 indices = i_eval
+            elif split == "all":
+                indices = i_all
             else:
                 raise ValueError(f"Unknown dataparser split {split}")
 
@@ -210,7 +197,14 @@ class Nerfstudio(DataParser):
             orientation_method = self.config.orientation_method
 
         poses = torch.from_numpy(np.array(poses).astype(np.float32))
-        poses, transform_matrix = camera_utils.auto_orient_and_center_poses( # 3, 4
+        if "format" in meta:
+            if meta["format"] == "OpenCV-RDF":
+                for i in range(poses.size()[0]):
+                    poses[i][0:3,1:3] *= -1
+                    poses[i] = poses[i][np.array([1, 0, 2, 3]), :]
+                    poses[i][2,:] *= -1
+
+        poses, transform_matrix = camera_utils.auto_orient_and_center_poses(
             poses,
             method=orientation_method,
             center_method=self.config.center_method,
@@ -235,34 +229,11 @@ class Nerfstudio(DataParser):
         # in x,y,z order
         # assumes that the scene is centered at the origin
         aabb_scale = self.config.scene_scale
-        pc_box = None
-        cam_aabb = torch.tensor(
-            [[-aabb_scale, -aabb_scale, -aabb_scale], [aabb_scale, aabb_scale, aabb_scale]], dtype=torch.float32
+        scene_box = SceneBox(
+            aabb=torch.tensor(
+                [[-aabb_scale, -aabb_scale, -aabb_scale], [aabb_scale, aabb_scale, aabb_scale]], dtype=torch.float32
+            )
         )
-        cam_box = SceneBox(
-            aabb=cam_aabb 
-        )
-
-        if "object_pc_aabb" in meta:
-        # if self.config.object_pc_path:
-        #     object_pcd = o3d.io.read_point_cloud(self.config.object_pc_path)
-        #     object_aabb = object_pcd.get_axis_aligned_bounding_box()
-        #     point_min = torch.tensor(np.hstack((object_aabb.min_bound[[2, 0, 1]], 1)), dtype=torch.float32).unsqueeze(-1)
-        #     point_max = torch.tensor(np.hstack((object_aabb.max_bound[[2, 0, 1]], 1)), dtype=torch.float32).unsqueeze(-1)
-            object_pc_aabb = torch.tensor(meta["object_pc_aabb"], dtype=torch.float32) # 2, 4
-            pc_box = SceneBox(aabb = object_pc_aabb[..., :-1])
-
-            point_min = object_pc_aabb[0].unsqueeze(-1)
-            point_max = object_pc_aabb[1].unsqueeze(-1)
-            transformed_point_min = transform_matrix @ point_min
-            transformed_point_max = transform_matrix @ point_max
-
-            transformed_object_aabb = torch.cat((transformed_point_min.T, transformed_point_max.T), dim = 0)
-            transformed_object_aabb *= scale_factor
-            object_aabb = transformed_object_aabb
-            scene_box = SceneBox(aabb = object_aabb)
-        else:
-            scene_box = cam_box
 
         if "camera_model" in meta:
             camera_type = CAMERA_MODEL_TO_TYPE[meta["camera_model"]]
@@ -287,7 +258,7 @@ class Nerfstudio(DataParser):
         else:
             distortion_params = torch.stack(distort, dim=0)[idx_tensor]
 
-        cameras = Cameras(
+        cameras = NsobCameras(
             fx=fx,
             fy=fy,
             cx=cx,
@@ -299,70 +270,8 @@ class Nerfstudio(DataParser):
             camera_type=camera_type,
         )
 
-        N_max = None
-        N_min = None
-
-        if "object_pc_aabb" in meta and split=="train":
-            if "N_max" in meta and "N_min" in meta:
-                N_max = int(meta["N_max"])
-                N_min = int(meta["N_min"])
-                tmin = float(meta["t_min"])
-                tmax = float(meta["t_max"])
-                fl_tmin = float(meta["fl_tmin"])
-                fl_tmax = float(meta["fl_tmax"])
-
-                print("Loaded N-max from json !")
-
-            else:
-                tmin = 1e10
-                tmax = 0
-                ind_min, ind_max = 0, 0
-                for camera_indice in range(cameras.size):
-                    print("Camera_indice:", camera_indice)
-                    ray_bundle = cameras.generate_rays(camera_indices=camera_indice, aabb_box=scene_box)
-                    # ray_bundle = cameras.generate_rays(camera_indices=camera_indice)
-                    near_min = torch.min(ray_bundle.nears).item()
-                    fars = ray_bundle.fars
-                    cond = fars >= 1e10
-                    fars = torch.where(cond, -1, fars)
-                    far_max = torch.max(fars).item()
-                    if near_min < tmin:
-                        ind_min = camera_indice
-                        tmin = near_min
-                    if far_max > tmax:
-                        ind_max = camera_indice
-                        tmax = far_max
-                    # tmin = min(tmin, near_min)
-                    # tmax = max(tmax, far_max)
-
-                t_offset = (tmax - tmin) * 0.1
-                tmin += t_offset
-                tmax -= t_offset
-                fl_tmin = cameras.fx[ind_min].item()
-                fl_tmax = cameras.fx[ind_max].item()
-                
-                N_max = math.ceil(fl_tmin/tmin)
-                N_min = math.ceil(fl_tmax/tmax)
-
-                meta["N_max"] = N_max
-                meta["N_min"] = N_min
-                meta["t_min"] = tmin
-                meta["t_max"] = tmax
-                meta["fl_tmin"] = fl_tmin
-                meta["fl_tmax"] = fl_tmax
-
-                if self.config.data.suffix == ".json":
-                    write_to_json(self.config.data, meta)
-                else:
-                    write_to_json(self.config.data / "transforms.json", meta)
-
-        # else:
-        #     N_max = 10 * cameras.width[0].item()
-
-            # # Compute distance from camera pose to bbox center
-            # box_center = (aabb[0] + aabb[1]) /2
-            # cam_position = cameras.camera_to_worlds[:,:,-1]
-            # distances = torch.norm(cam_position - box_center, dim=1)
+        if "downscale_factor" in meta:
+            cameras.rescale_output_resolution(scaling_factor=1.0 / meta["downscale_factor"])
 
         assert self.downscale_factor is not None
         cameras.rescale_output_resolution(scaling_factor=1.0 / self.downscale_factor)
@@ -380,10 +289,6 @@ class Nerfstudio(DataParser):
             image_filenames=image_filenames,
             cameras=cameras,
             scene_box=scene_box,
-            cam_box=cam_box,
-            photogrametry_pc_box=pc_box,
-            N_max=N_max,
-            N_min=N_min,
             mask_filenames=mask_filenames if len(mask_filenames) > 0 else None,
             dataparser_scale=scale_factor,
             dataparser_transform=transform_matrix,

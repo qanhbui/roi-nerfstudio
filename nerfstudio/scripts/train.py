@@ -253,18 +253,36 @@ def main(config: TrainerConfig) -> None:
         config=config,
     )
 
+import hydra
+from hydra.core.global_hydra import GlobalHydra
 
 def entrypoint():
     """Entrypoint for use with pyproject scripts."""
     # Choose a base configuration and override values.
     tyro.extras.set_accent_color("bright_yellow")
-    main(
-        tyro.cli(
-            AnnotatedBaseConfigUnion,
-            description=convert_markup_to_ansi(__doc__),
-        )
+    train_args = tyro.cli(
+        AnnotatedBaseConfigUnion,
+        description=convert_markup_to_ansi(__doc__),
     )
 
+    if train_args.load_hydra_configs:
+        # Clear the existing GlobalHydra instance, if any
+        GlobalHydra.instance().clear()
 
+        hydra.initialize(version_base=None, config_path="conf", job_name="train") # init like @hydra.main()
+        cfg = hydra.compose("train_configs")
+
+        for key in cfg.keys():
+            parts = key.split('.')
+            sub_cfg = train_args
+            for part in parts[:-1]:
+                assert hasattr(sub_cfg, part)
+                sub_cfg = getattr(sub_cfg, part)
+            setattr(sub_cfg, parts[-1], cfg[key])
+        main(train_args)
+    else:
+        main(train_args)
+    
+    
 if __name__ == "__main__":
     entrypoint()

@@ -33,7 +33,7 @@ from nerfstudio.configs.config_utils import to_immutable_dict
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes
 from nerfstudio.model_components.scene_colliders import NearFarCollider
-
+from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
 
 # Model related configs
 @dataclass
@@ -70,12 +70,20 @@ class Model(nn.Module):
         self,
         config: ModelConfig,
         scene_box: SceneBox,
+        cam_box: SceneBox,
+        photogrametry_pc_box: SceneBox,
+        N_max: int,
+        N_min: int,
         num_train_data: int,
         **kwargs,
     ) -> None:
         super().__init__()
         self.config = config
         self.scene_box = scene_box
+        self.cam_box = cam_box
+        self.photogrametry_pc_box = photogrametry_pc_box
+        self.N_max = N_max
+        self.N_min = N_min
         self.render_aabb: Optional[SceneBox] = None  # the box that we want to render - should be a subset of scene_box
         self.num_train_data = num_train_data
         self.kwargs = kwargs
@@ -128,7 +136,15 @@ class Model(nn.Module):
             Outputs of model. (ie. rendered colors)
         """
 
-    def forward(self, ray_bundle: RayBundle) -> Dict[str, Union[torch.Tensor, List]]:
+    def forward(
+        self, 
+        ray_bundle: RayBundle, 
+        object_ray_bundles_list: List[RayBundle] = None, 
+        object_models_list: List[Model] = None,
+        dataparser_outputs: DataparserOutputs = None,
+        object_dataparser_outputs_list: List[DataparserOutputs] = None,
+        scene_object_boxes_list: Optional[List[SceneBox]] = None,
+    ) -> Dict[str, Union[torch.Tensor, List]]:
         """Run forward starting with a ray bundle. This outputs different things depending on the configuration
         of the model and whether or not the batch is provided (whether or not we are training basically)
 
@@ -138,8 +154,18 @@ class Model(nn.Module):
 
         if self.collider is not None:
             ray_bundle = self.collider(ray_bundle)
+            if object_ray_bundles_list:
+                for index, object_ray_bundle in enumerate(object_ray_bundles_list):
+                    object_ray_bundles_list[index] = self.collider(object_ray_bundle)
 
-        return self.get_outputs(ray_bundle)
+        return self.get_outputs(
+            ray_bundle, 
+            object_ray_bundles_list=object_ray_bundles_list,
+            object_models_list=object_models_list, 
+            dataparser_outputs=dataparser_outputs, 
+            object_dataparser_outputs_list=object_dataparser_outputs_list,
+            scene_object_boxes_list=scene_object_boxes_list
+        )
 
     def get_metrics_dict(self, outputs, batch) -> Dict[str, torch.Tensor]:
         """Compute and returns metrics.
@@ -162,21 +188,52 @@ class Model(nn.Module):
         """
 
     @torch.no_grad()
-    def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
+    def get_outputs_for_camera_ray_bundle(
+        self, 
+        camera_ray_bundle: RayBundle, 
+        object_camera_ray_bundles_list: List[RayBundle] = None, 
+        object_models_list: List[Model] = None,
+        dataparser_outputs: DataparserOutputs = None,
+        object_dataparser_outputs_list: List[DataparserOutputs] = None, 
+        scene_object_boxes_list: Optional[List[SceneBox]] = None,
+    ) -> Dict[str, torch.Tensor]:
         """Takes in camera parameters and computes the output of the model.
 
         Args:
             camera_ray_bundle: ray bundle to calculate outputs over
         """
         num_rays_per_chunk = self.config.eval_num_rays_per_chunk
-        image_height, image_width = camera_ray_bundle.origins.shape[:2]
+        if len(camera_ray_bundle.origins.shape) == 3:
+            image_height, image_width = camera_ray_bundle.origins.shape[:2]
+        elif len(camera_ray_bundle.origins.shape) == 2:
+            image_height = camera_ray_bundle.height
+            image_width = camera_ray_bundle.width
         num_rays = len(camera_ray_bundle)
         outputs_lists = defaultdict(list)
         for i in range(0, num_rays, num_rays_per_chunk):
             start_idx = i
             end_idx = i + num_rays_per_chunk
             ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
-            outputs = self.forward(ray_bundle=ray_bundle)
+            if object_camera_ray_bundles_list:
+                object_ray_bundles_list = []
+                for object_camera_ray_bundle in object_camera_ray_bundles_list:
+                    object_ray_bundle = object_camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+                    object_ray_bundles_list.append(object_ray_bundle)
+                outputs = self.forward(
+                    ray_bundle=ray_bundle, 
+                    object_ray_bundles_list=object_ray_bundles_list,
+                    object_models_list=object_models_list, 
+                    dataparser_outputs=dataparser_outputs, 
+                    object_dataparser_outputs_list=object_dataparser_outputs_list,
+                    scene_object_boxes_list=scene_object_boxes_list
+                )
+            else:
+                outputs = self.forward(
+                    ray_bundle=ray_bundle,
+                    # object_models_list=object_models_list, 
+                    # dataparser_outputs=dataparser_outputs, 
+                    # object_dataparser_outputs_list=object_dataparser_outputs_list
+                )
             for output_name, output in outputs.items():  # type: ignore
                 if not torch.is_tensor(output):
                     # TODO: handle lists of tensors as well

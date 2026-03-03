@@ -1,0 +1,23 @@
+db:
+  machine_indice: 0
+  machine: 
+    - DGX
+
+  objects_indices: [0,1]
+  write_json: False
+  cam_visu: False
+  cam_heatmap_visu: False
+  object_indice_visu: 0
+  all_visu: False
+  out_dir_prename: transforms_wPC
+
+  DGX:
+    out_file_path: ../cam.out
+    sparse_full_pcd: ../pcd.ply
+    sparse_pcd: ../pcd.ply
+
+    object_pc_path_1: ../pcd_roi1.ply
+    object_pc_path_2: ../pcd_roi2.ply
+
+    json_path: ../transforms.json
+

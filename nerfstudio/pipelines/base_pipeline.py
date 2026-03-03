@@ -24,6 +24,9 @@ from pathlib import Path
 from time import time
 from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Type, Union, cast
 
+import numpy as np
+import numpy.typing as npt
+
 import torch
 import torch.distributed as dist
 from PIL import Image
@@ -39,12 +42,16 @@ from torch.nn import Parameter
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp.grad_scaler import GradScaler
 
+from nerfstudio.cameras.cameras import Cameras
+# from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.configs import base_config as cfg
 from nerfstudio.data.datamanagers.base_datamanager import (
     DataManager,
     DataManagerConfig,
     VanillaDataManager,
 )
+# from nerfstudio.data.dataparsers.base_dataparser import DataparserOutputs
+from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import profiler
@@ -269,6 +276,10 @@ class VanillaPipeline(Pipeline):
 
         self._model = config.model.setup(
             scene_box=self.datamanager.train_dataset.scene_box,
+            cam_box=self.datamanager.train_dataset.cam_box,
+            photogrametry_pc_box=self.datamanager.train_dataset.photogrametry_pc_box,
+            N_max=self.datamanager.train_dataset.N_max,
+            N_min=self.datamanager.train_dataset.N_min,
             num_train_data=len(self.datamanager.train_dataset),
             metadata=self.datamanager.train_dataset.metadata,
             device=device,
@@ -419,6 +430,292 @@ class VanillaPipeline(Pipeline):
                 )
         self.train()
         return metrics_dict
+
+    @profiler.time_function
+    def get_average_eval_image_metrics_compo(
+        self, 
+        step: Optional[int] = None, 
+        output_path: Optional[Path] = None, 
+        get_std: bool = False,
+        cameras: Optional[Cameras] = None,
+        image_paths: Optional[List[Path]] = None,
+        object_pipelines_list: List[Pipeline] = None,
+        object_cameras_list: List[Cameras] = None,
+        aabb_only: bool = False,
+    ):
+        """Iterate over all the images in the eval dataset and get the average.
+
+        Args:
+            step: current training step
+            output_path: optional path to save rendered images to
+            get_std: Set True if you want to return std with the mean metric.
+
+        Returns:
+            metrics_dict: dictionary of metrics
+        """
+        self.eval()
+        metrics_dict_list = []
+        assert isinstance(self.datamanager, VanillaDataManager)
+        num_images = len(self.datamanager.fixed_indices_eval_dataloader)
+        
+        if cameras:
+            cameras = cameras.to(self.device)
+            num_images = cameras.size
+        
+        if object_pipelines_list:
+            dataparser_outputs = self.datamanager.dataparser.get_dataparser_outputs()
+            scene_scale = dataparser_outputs.dataparser_scale
+            scene_transform = dataparser_outputs.dataparser_transform # 3, 4
+            
+            object_dataparser_outputs_list = []
+            object_models_list = []
+            scene_object_boxes_list = []
+            
+            for object_pipeline in object_pipelines_list:
+                object_dataparser_outputs = object_pipeline.datamanager.dataparser.get_dataparser_outputs()
+                
+                object_dataparser_outputs_list.append(object_dataparser_outputs)
+                object_model = object_pipeline.model
+                object_models_list.append(object_model)
+
+                object_photogrametry_pc_box = object_model.photogrametry_pc_box
+                point_min = torch.cat((object_photogrametry_pc_box.aabb[0], torch.tensor([1]))).unsqueeze(-1)
+                point_max = torch.cat((object_photogrametry_pc_box.aabb[1], torch.tensor([1]))).unsqueeze(-1)
+                transformed_point_min = scene_transform @ point_min
+                transformed_point_max = scene_transform @ point_max
+                scene_object_aabb = torch.cat((transformed_point_min.T, transformed_point_max.T), dim = 0)
+                scene_object_aabb *= scene_scale
+                scene_object_box = SceneBox(aabb = scene_object_aabb)
+                scene_object_boxes_list.append(scene_object_box)
+
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            MofNCompleteColumn(),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("[green]Evaluating all eval images...", total=num_images)
+            
+            # for camera_idx in progress.track(range(cameras.size), description=""):  
+            for camera_idx in range(cameras.size):  
+                camera_ray_bundle = cameras.generate_rays(camera_indices=camera_idx, keep_shape=True)
+
+                image_path = image_paths[camera_idx]
+                image_name = image_path.name
+                pil_image = Image.open(image_path)
+                image = np.array(pil_image, dtype="uint8")  # shape is (h, w) or (h, w, 3 or 4)
+                if len(image.shape) == 2:
+                    image = image[:, :, None].repeat(3, axis=2)
+                assert len(image.shape) == 3
+                assert image.dtype == np.uint8
+                assert image.shape[2] in [3, 4], f"Image shape of {image.shape} is in correct."
+
+                image = torch.from_numpy(image.astype("float32") / 255.0)
+                batch = {"image_idx": camera_idx, "image": image}
+
+                if object_cameras_list:
+                    object_camera_ray_bundles_list = []
+                    for object_cameras in object_cameras_list:
+                        object_cameras = object_cameras.to(self.device)
+                        object_camera_ray_bundle = object_cameras.generate_rays(camera_indices=camera_idx, keep_shape=True)
+                        object_camera_ray_bundles_list.append(object_camera_ray_bundle)
+
+                inner_start = time()
+                height, width = camera_ray_bundle.shape
+                num_rays = height * width
+
+                if object_pipelines_list:
+                    outputs = self.model.get_outputs_for_camera_ray_bundle(
+                        camera_ray_bundle, 
+                        object_camera_ray_bundles_list=object_camera_ray_bundles_list,
+                        object_models_list=object_models_list,
+                        dataparser_outputs=dataparser_outputs, 
+                        object_dataparser_outputs_list=object_dataparser_outputs_list,
+                        scene_object_boxes_list=scene_object_boxes_list,
+                    )
+                else:
+                    outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+
+                metrics_dict, images_dict = self.model.get_image_metrics_and_images_compo(outputs, batch, aabb_only=aabb_only)
+
+                if output_path is not None:
+                    camera_indices = camera_ray_bundle.camera_indices
+                    assert camera_indices is not None
+                    for key, val in images_dict.items():
+                        Image.fromarray((val * 255).byte().cpu().numpy()).save(
+                            # output_path / "{0:06d}-{1}.jpg".format(int(camera_indices[0, 0, 0]), key)
+                            output_path / image_name
+                        )
+                assert "num_rays_per_sec" not in metrics_dict
+                metrics_dict["num_rays_per_sec"] = num_rays / (time() - inner_start)
+                fps_str = "fps"
+                assert fps_str not in metrics_dict
+                metrics_dict[fps_str] = metrics_dict["num_rays_per_sec"] / (height * width)
+                metrics_dict_list.append(metrics_dict)
+                progress.advance(task)
+        
+        # average the metrics list
+        metrics_dict = {}
+        for key in metrics_dict_list[0].keys():
+            if get_std:
+                key_std, key_mean = torch.std_mean(
+                    torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list])
+                )
+                metrics_dict[key] = float(key_mean)
+                metrics_dict[f"{key}_std"] = float(key_std)
+            else:
+                metrics_dict[key] = float(
+                    torch.mean(torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list]))
+                )
+        self.train()
+        return metrics_dict
+
+    @profiler.time_function
+    def get_average_eval_image_metrics_compo_aabb(
+        self, 
+        step: Optional[int] = None, 
+        output_path: Optional[Path] = None, 
+        get_std: bool = False,
+        cameras: Optional[Cameras] = None,
+        image_paths: Optional[List[Path]] = None,
+        object_pipelines_list: List[Pipeline] = None,
+        object_cameras_list: List[Cameras] = None,
+        aabb_only: bool = False,
+        compo_outputs_list: List[Dict[str, torch.Tensor]] = None,
+    ):
+        """Iterate over all the images in the eval dataset and get the average.
+
+        Args:
+            step: current training step
+            output_path: optional path to save rendered images to
+            get_std: Set True if you want to return std with the mean metric.
+
+        Returns:
+            metrics_dict: dictionary of metrics
+        """
+        self.eval()
+        metrics_dict_list = []
+        assert isinstance(self.datamanager, VanillaDataManager)
+        num_images = len(self.datamanager.fixed_indices_eval_dataloader)
+        
+        if cameras:
+            cameras = cameras.to(self.device)
+            num_images = cameras.size
+        
+        if object_pipelines_list:
+            dataparser_outputs = self.datamanager.dataparser.get_dataparser_outputs()
+            scene_scale = dataparser_outputs.dataparser_scale
+            scene_transform = dataparser_outputs.dataparser_transform # 3, 4
+            
+            object_dataparser_outputs_list = []
+            object_models_list = []
+            scene_object_boxes_list = []
+            
+            for object_pipeline in object_pipelines_list:
+                object_dataparser_outputs = object_pipeline.datamanager.dataparser.get_dataparser_outputs()
+                
+                object_dataparser_outputs_list.append(object_dataparser_outputs)
+                object_model = object_pipeline.model
+                object_models_list.append(object_model)
+
+                object_photogrametry_pc_box = object_model.photogrametry_pc_box
+                point_min = torch.cat((object_photogrametry_pc_box.aabb[0], torch.tensor([1]))).unsqueeze(-1)
+                point_max = torch.cat((object_photogrametry_pc_box.aabb[1], torch.tensor([1]))).unsqueeze(-1)
+                transformed_point_min = scene_transform @ point_min
+                transformed_point_max = scene_transform @ point_max
+                scene_object_aabb = torch.cat((transformed_point_min.T, transformed_point_max.T), dim = 0)
+                scene_object_aabb *= scene_scale
+                scene_object_box = SceneBox(aabb = scene_object_aabb)
+                scene_object_boxes_list.append(scene_object_box)
+
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            MofNCompleteColumn(),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("[green]Evaluating all eval images...", total=num_images)
+            
+            # for camera_idx in progress.track(range(cameras.size), description=""):  
+            outputs_list =[]
+            for camera_idx in range(cameras.size):  
+                camera_ray_bundle = cameras.generate_rays(camera_indices=camera_idx, keep_shape=True)
+
+                image_path = image_paths[camera_idx]
+                image_name = image_path.name
+                pil_image = Image.open(image_path)
+                image = np.array(pil_image, dtype="uint8")  # shape is (h, w) or (h, w, 3 or 4)
+                if len(image.shape) == 2:
+                    image = image[:, :, None].repeat(3, axis=2)
+                assert len(image.shape) == 3
+                assert image.dtype == np.uint8
+                assert image.shape[2] in [3, 4], f"Image shape of {image.shape} is in correct."
+
+                image = torch.from_numpy(image.astype("float32") / 255.0)
+                batch = {"image_idx": camera_idx, "image": image}
+
+                if object_cameras_list:
+                    object_camera_ray_bundles_list = []
+                    for object_cameras in object_cameras_list:
+                        object_cameras = object_cameras.to(self.device)
+                        object_camera_ray_bundle = object_cameras.generate_rays(camera_indices=camera_idx, keep_shape=True)
+                        object_camera_ray_bundles_list.append(object_camera_ray_bundle)
+
+                inner_start = time()
+                height, width = camera_ray_bundle.shape
+                num_rays = height * width
+
+                if object_pipelines_list:
+                    outputs = self.model.get_outputs_for_camera_ray_bundle(
+                        camera_ray_bundle, 
+                        object_camera_ray_bundles_list=object_camera_ray_bundles_list,
+                        object_models_list=object_models_list,
+                        dataparser_outputs=dataparser_outputs, 
+                        object_dataparser_outputs_list=object_dataparser_outputs_list,
+                        scene_object_boxes_list=scene_object_boxes_list,
+                    )
+                else:
+                    outputs = self.model.get_outputs_for_camera_ray_bundle(camera_ray_bundle)
+
+                outputs_list.append(outputs)
+                if compo_outputs_list is not None:
+                    metrics_dict, images_dict = self.model.get_image_metrics_and_images_compo(outputs, batch, aabb_only=aabb_only, compo_outputs=compo_outputs_list[camera_idx])
+                else:
+                    metrics_dict, images_dict = self.model.get_image_metrics_and_images_compo(outputs, batch, aabb_only=aabb_only)
+
+                if output_path is not None:
+                    camera_indices = camera_ray_bundle.camera_indices
+                    assert camera_indices is not None
+                    for key, val in images_dict.items():
+                        Image.fromarray((val * 255).byte().cpu().numpy()).save(
+                            # output_path / "{0:06d}-{1}.jpg".format(int(camera_indices[0, 0, 0]), key)
+                            output_path / image_name
+                        )
+                assert "num_rays_per_sec" not in metrics_dict
+                metrics_dict["num_rays_per_sec"] = num_rays / (time() - inner_start)
+                fps_str = "fps"
+                assert fps_str not in metrics_dict
+                metrics_dict[fps_str] = metrics_dict["num_rays_per_sec"] / (height * width)
+                metrics_dict_list.append(metrics_dict)
+                progress.advance(task)
+        
+        # average the metrics list
+        metrics_dict = {}
+        for key in metrics_dict_list[0].keys():
+            if get_std:
+                key_std, key_mean = torch.std_mean(
+                    torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list])
+                )
+                metrics_dict[key] = float(key_mean)
+                metrics_dict[f"{key}_std"] = float(key_std)
+            else:
+                metrics_dict[key] = float(
+                    torch.mean(torch.tensor([metrics_dict[key] for metrics_dict in metrics_dict_list]))
+                )
+        self.train()
+        return metrics_dict, outputs_list
 
     def load_pipeline(self, loaded_state: Dict[str, Any], step: int) -> None:
         """Load the checkpoint from the given path

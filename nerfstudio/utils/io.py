@@ -40,4 +40,4 @@ def write_to_json(filename: Path, content: dict):
     """
     assert filename.suffix == ".json"
     with open(filename, "w", encoding="UTF-8") as file:
-        json.dump(content, file)
+        json.dump(content, file, indent=4)

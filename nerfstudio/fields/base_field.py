@@ -69,7 +69,7 @@ class Field(nn.Module):
 
     @abstractmethod
     def get_density(
-        self, ray_samples: RaySamples
+        self, ray_samples: RaySamples, selected_infos: Dict = None
     ) -> Tuple[Shaped[Tensor, "*batch 1"], Float[Tensor, "*batch num_features"]]:
         """Computes and returns the densities. Returns a tensor of densities and a tensor of features.
 
@@ -102,7 +102,7 @@ class Field(nn.Module):
 
     @abstractmethod
     def get_outputs(
-        self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None
+        self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None, selected_infos: Dict = None
     ) -> Dict[FieldHeadNames, Tensor]:
         """Computes and returns the colors. Returns output field values.
 
@@ -111,19 +111,24 @@ class Field(nn.Module):
             density_embedding: Density embeddings to condition on.
         """
 
-    def forward(self, ray_samples: RaySamples, compute_normals: bool = False) -> Dict[FieldHeadNames, Tensor]:
+    def forward(self, ray_samples: RaySamples, compute_normals: bool = False, selected_infos: Dict = None) -> Dict[FieldHeadNames, Tensor]:
         """Evaluates the field at points along the ray.
 
         Args:
             ray_samples: Samples to evaluate field on.
         """
-        if compute_normals:
+        if compute_normals: # False for nerfacto default
             with torch.enable_grad():
                 density, density_embedding = self.get_density(ray_samples)
+        elif selected_infos is not None:
+            density, density_embedding = self.get_density(ray_samples, selected_infos=selected_infos)
         else:
             density, density_embedding = self.get_density(ray_samples)
 
-        field_outputs = self.get_outputs(ray_samples, density_embedding=density_embedding)
+        if selected_infos is not None:
+            field_outputs = self.get_outputs(ray_samples, density_embedding=density_embedding, selected_infos=selected_infos)
+        else:
+            field_outputs = self.get_outputs(ray_samples, density_embedding=density_embedding)
         field_outputs[FieldHeadNames.DENSITY] = density  # type: ignore
 
         if compute_normals:

@@ -38,9 +38,10 @@ from nerfstudio.field_components.field_heads import (
 from nerfstudio.field_components.mlp import MLP
 from nerfstudio.field_components.spatial_distortions import SpatialDistortion
 from nerfstudio.fields.base_field import Field, get_normalized_directions
+# from nerfstudio.fields.nerfacto_field import NerfactoField
 
 
-class NerfactoField(Field):
+class NsobField(Field):
     """Compound Field that uses TCNN
 
     Args:
@@ -200,90 +201,62 @@ class NerfactoField(Field):
             implementation=implementation,
         )
 
-    def get_density(self, ray_samples: RaySamples, selected_infos: Dict = None) -> Tuple[Tensor, Tensor]:
+    def get_density(self, ray_samples: RaySamples) -> Tuple[Tensor, Tensor]:
         """Computes and returns the densities."""
-
-        if selected_infos is not None:
-            if self.spatial_distortion is not None:
-                positions = selected_infos["positions_flat"] # n, 3
-                positions = self.spatial_distortion(positions)
-                positions = (positions + 2.0) / 4.0
-            else:
-                positions = SceneBox.get_normalized_positions(selected_infos["positions_flat"], self.aabb)
-        elif self.spatial_distortion is not None:
-            positions = ray_samples.frustums.get_positions() # 32768, 48, 3
+        if self.spatial_distortion is not None:
+            positions = ray_samples.frustums.get_positions()
             positions = self.spatial_distortion(positions)
             positions = (positions + 2.0) / 4.0
-            # Flatten tensor to n, 3 before calcutation
-            positions = positions.view(-1, 3) # 1572864, 3 or n, 3
         else:
             positions = SceneBox.get_normalized_positions(ray_samples.frustums.get_positions(), self.aabb)
-            # Flatten tensor to n, 3 before calcutation
-            positions = positions.view(-1, 3) # 1572864, 3 or n, 3
-        
         # Make sure the tcnn gets inputs between 0 and 1.
-        selector = ((positions > 0.0) & (positions < 1.0)).all(dim=-1) # 32768, 48 -> n
+        selector = ((positions > 0.0) & (positions < 1.0)).all(dim=-1)
         positions = positions * selector[..., None]
         self._sample_locations = positions
         if not self._sample_locations.requires_grad:
             self._sample_locations.requires_grad = True
-        
-        # positions_flat = positions.view(-1, 3) # 1572864, 3
-        h = self.mlp_base(positions) # 1572864, 16
-
-        # # No reshape h tensor to ray_samples original shape
-        # h = h.view(*ray_samples.frustums.shape, -1) # 32768, 48, 16
-
-        density_before_activation, base_mlp_out = torch.split(h, [1, self.geo_feat_dim], dim=-1) # density_before_activation: 32768, 48, 1, base_mlp_out: 32768, 48, 15
+        positions_flat = positions.view(-1, 3)
+        h = self.mlp_base(positions_flat).view(*ray_samples.frustums.shape, -1)
+        density_before_activation, base_mlp_out = torch.split(h, [1, self.geo_feat_dim], dim=-1)
         self._density_before_activation = density_before_activation
 
         # Rectifying the density with an exponential is much more stable than a ReLU or
         # softplus, because it enables high post-activation (float32) density outputs
         # from smaller internal (float16) parameters.
-        density = trunc_exp(density_before_activation.to(positions)) # 32768, 48, 1 -> n, 1
+        density = trunc_exp(density_before_activation.to(positions))
         density = density * selector[..., None]
         return density, base_mlp_out
 
     def get_outputs(
-        self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None, selected_infos: Dict = None
+        self, ray_samples: RaySamples, density_embedding: Optional[Tensor] = None
     ) -> Dict[FieldHeadNames, Tensor]:
         assert density_embedding is not None
         outputs = {}
-        if ray_samples.camera_indices is None: # 32768, 48, 1
+        if ray_samples.camera_indices is None:
             raise AttributeError("Camera indices are not provided.")
-        if selected_infos is not None:
-            camera_indices_flat = selected_infos["camera_indices_flat"].squeeze() # 1572864
-            directions_flat = get_normalized_directions(selected_infos["directions_flat"])
-            outputs_shape = selected_infos["directions_flat"].shape[:-1]
-        else:
-            camera_indices = ray_samples.camera_indices.squeeze() # 32768, 48
-            camera_indices_flat = camera_indices.reshape(-1) # 1572864
-            directions = get_normalized_directions(ray_samples.frustums.directions) # 32768, 48, 3
-            directions_flat = directions.view(-1, 3) # 1572864, 3
-            outputs_shape = ray_samples.frustums.directions.reshape(-1, 3).shape[:-1]
+        camera_indices = ray_samples.camera_indices.squeeze()
+        directions = get_normalized_directions(ray_samples.frustums.directions)
+        directions_flat = directions.view(-1, 3)
+        d = self.direction_encoding(directions_flat)
 
-        d = self.direction_encoding(directions_flat) # 1572864, 16
+        outputs_shape = ray_samples.frustums.directions.shape[:-1]
 
         # appearance
         if self.training:
-            # embedded_appearance = self.embedding_appearance(camera_indices) # 32768, 48, 32
-            embedded_appearance = self.embedding_appearance(camera_indices_flat) # 1572864, 32
+            embedded_appearance = self.embedding_appearance(camera_indices)
         else:
             if self.use_average_appearance_embedding:
                 embedded_appearance = torch.ones(
-                    # (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
-                    (*directions_flat.shape[:-1], self.appearance_embedding_dim), device=directions_flat.device
+                    (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
                 ) * self.embedding_appearance.mean(dim=0)
             else:
                 embedded_appearance = torch.zeros(
-                    # (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
-                    (*directions_flat.shape[:-1], self.appearance_embedding_dim), device=directions_flat.device
+                    (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
                 )
 
         # transients
         if self.use_transient_embedding and self.training:
-            # embedded_transient = self.embedding_transient(camera_indices)
-            embedded_transient = self.embedding_transient(camera_indices_flat)
+            embedded_transient = self.embedding_transient(camera_indices)
             transient_input = torch.cat(
                 [
                     density_embedding.view(-1, self.geo_feat_dim),
@@ -291,7 +264,7 @@ class NerfactoField(Field):
                 ],
                 dim=-1,
             )
-            x = self.mlp_transient(transient_input).view(*outputs_shape, -1).to(directions_flat)
+            x = self.mlp_transient(transient_input).view(*outputs_shape, -1).to(directions)
             outputs[FieldHeadNames.UNCERTAINTY] = self.field_head_transient_uncertainty(x)
             outputs[FieldHeadNames.TRANSIENT_RGB] = self.field_head_transient_rgb(x)
             outputs[FieldHeadNames.TRANSIENT_DENSITY] = self.field_head_transient_density(x)
@@ -302,19 +275,17 @@ class NerfactoField(Field):
             if not self.pass_semantic_gradients:
                 semantics_input = semantics_input.detach()
 
-            x = self.mlp_semantics(semantics_input).view(*outputs_shape, -1).to(directions_flat)
+            x = self.mlp_semantics(semantics_input).view(*outputs_shape, -1).to(directions)
             outputs[FieldHeadNames.SEMANTICS] = self.field_head_semantics(x)
 
         # predicted normals
         if self.use_pred_normals:
-            if selected_infos is not None:
-                positions = ray_samples.frustums.get_positions()
-                positions_flat = self.position_encoding(positions.view(-1, 3))
-            else:
-                positions_flat = self.position_encoding(selected_infos["positions_flat"])
+            positions = ray_samples.frustums.get_positions()
+
+            positions_flat = self.position_encoding(positions.view(-1, 3))
             pred_normals_inp = torch.cat([positions_flat, density_embedding.view(-1, self.geo_feat_dim)], dim=-1)
 
-            x = self.mlp_pred_normals(pred_normals_inp).view(*outputs_shape, -1).to(directions_flat)
+            x = self.mlp_pred_normals(pred_normals_inp).view(*outputs_shape, -1).to(directions)
             outputs[FieldHeadNames.PRED_NORMALS] = self.field_head_pred_normals(x)
 
         h = torch.cat(
@@ -325,7 +296,7 @@ class NerfactoField(Field):
             ],
             dim=-1,
         )
-        rgb = self.mlp_head(h).view(*outputs_shape, -1).to(directions_flat)
+        rgb = self.mlp_head(h).view(*outputs_shape, -1).to(directions)
         outputs.update({FieldHeadNames.RGB: rgb})
 
         return outputs
