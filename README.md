@@ -11,7 +11,7 @@ The approach significantly enhances specific objects fidelity with minimal compu
 The method builds primarily on the [Nerfacto](https://docs.nerf.studio/nerfology/methods/nerfacto.html) method of Nerfstudio.
 
 <p align="center">
-  <img src="readme_images/ROI-NeRFs_pipeline.png" alt="ROI-NeRFs Pipeline" width="100%"/>
+  <img src="docs/static/images/ROI-NeRFs_pipeline.png" alt="ROI-NeRFs Pipeline" width="100%"/>
 </p>
 
 ## Installation
